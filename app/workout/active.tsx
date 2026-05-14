@@ -12,11 +12,21 @@ import { ProgressBar } from '@/components/ProgressBar';
 import { Icon } from '@/components/Icon';
 import { Pill } from '@/components/Pill';
 import { useTheme } from '@/components/ThemeProvider';
-import { useWorkout, type ActiveExercise, type ActiveSet } from '@/stores/workout';
+import { PlateCalcModal } from '@/components/PlateCalcModal';
+import { useWorkout, type ActiveExercise, type ActiveSet, type LastCompletedSet } from '@/stores/workout';
+import { useSettings } from '@/stores/settings';
 import { supabase } from '@/lib/supabase';
 import { muscleLabel, formatDuration } from '@/lib/format';
 import { MUSCLE_COLOR, MUSCLE_FILTERS } from '@/lib/muscleColors';
+import { generateWarmup, plateHint } from '@/lib/plates';
 import type { ExerciseRow, MuscleGroup } from '@/lib/database.types';
+
+interface PlateEditorTarget {
+  exerciseId: string;
+  setId: string;
+  exerciseName: string;
+  initialWeight: number;
+}
 
 export default function ActiveWorkoutScreen() {
   const theme = useTheme();
@@ -24,14 +34,18 @@ export default function ActiveWorkoutScreen() {
   const restRemaining = useWorkout((s) => s.restRemaining);
   const restTotal = useWorkout((s) => s.restTotal);
   const tickRest = useWorkout((s) => s.tickRest);
+  const bumpRest = useWorkout((s) => s.bumpRest);
   const cancel = useWorkout((s) => s.cancel);
   const finish = useWorkout((s) => s.finish);
   const addExercise = useWorkout((s) => s.addExercise);
+  const updateSet = useWorkout((s) => s.updateSet);
+  const lastSets = useWorkout((s) => s.lastSets);
   const queryClient = useQueryClient();
 
   const [elapsed, setElapsed] = useState(0);
   const [picker, setPicker] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [plateTarget, setPlateTarget] = useState<PlateEditorTarget | null>(null);
 
   useEffect(() => {
     if (!active) return;
@@ -168,10 +182,7 @@ export default function ActiveWorkoutScreen() {
       </View>
 
       {restRemaining > 0 ? (
-        <Pressable
-          onPress={() => useWorkout.getState().setRest(0)}
-          style={{ paddingHorizontal: 20, marginBottom: 12 }}
-        >
+        <View style={{ paddingHorizontal: 20, marginBottom: 12 }}>
           <LinearGradient
             colors={theme.gradients.primary}
             start={{ x: 0, y: 0 }}
@@ -189,11 +200,40 @@ export default function ActiveWorkoutScreen() {
                 {formatDuration(restRemaining)}
               </Text>
             </View>
-            <View style={styles.restSkipBtn}>
-              <Text style={styles.restSkipText}>Skip</Text>
+            <View style={styles.restControls}>
+              <Pressable
+                onPress={() => {
+                  bumpRest(-30);
+                  Haptics.selectionAsync().catch(() => undefined);
+                }}
+                style={({ pressed }) => [styles.restBumpBtn, { opacity: pressed ? 0.7 : 1 }]}
+                hitSlop={6}
+              >
+                <Text style={styles.restBumpText}>-30</Text>
+              </Pressable>
+              <Pressable
+                onPress={() => {
+                  bumpRest(30);
+                  Haptics.selectionAsync().catch(() => undefined);
+                }}
+                style={({ pressed }) => [styles.restBumpBtn, { opacity: pressed ? 0.7 : 1 }]}
+                hitSlop={6}
+              >
+                <Text style={styles.restBumpText}>+30</Text>
+              </Pressable>
+              <Pressable
+                onPress={() => {
+                  useWorkout.getState().setRest(0);
+                  Haptics.selectionAsync().catch(() => undefined);
+                }}
+                style={({ pressed }) => [styles.restSkipBtn, { opacity: pressed ? 0.7 : 1 }]}
+                hitSlop={6}
+              >
+                <Text style={styles.restSkipText}>Skip</Text>
+              </Pressable>
             </View>
           </LinearGradient>
-        </Pressable>
+        </View>
       ) : null}
 
       <ScrollView
@@ -216,7 +256,13 @@ export default function ActiveWorkoutScreen() {
         ) : null}
 
         {active.exercises.map((ex, idx) => (
-          <ExerciseBlock key={ex.exerciseId} ex={ex} index={idx} />
+          <ExerciseBlock
+            key={ex.exerciseId}
+            ex={ex}
+            index={idx}
+            lastCompleted={lastSets[ex.exerciseId] ?? null}
+            onOpenPlateCalc={(target) => setPlateTarget(target)}
+          />
         ))}
 
         <Pressable
@@ -247,21 +293,70 @@ export default function ActiveWorkoutScreen() {
           onClose={() => setPicker(false)}
         />
       </Modal>
+
+      <PlateCalcModal
+        visible={!!plateTarget}
+        initialWeight={plateTarget?.initialWeight ?? 0}
+        exerciseName={plateTarget?.exerciseName}
+        onClose={() => setPlateTarget(null)}
+        onApply={(weight) => {
+          if (plateTarget) {
+            updateSet(plateTarget.exerciseId, plateTarget.setId, { weight });
+          }
+          setPlateTarget(null);
+        }}
+      />
     </SafeAreaView>
   );
 }
 
-function ExerciseBlock({ ex, index }: { ex: ActiveExercise; index: number }) {
+function ExerciseBlock({
+  ex,
+  index,
+  lastCompleted,
+  onOpenPlateCalc,
+}: {
+  ex: ActiveExercise;
+  index: number;
+  lastCompleted: LastCompletedSet | null;
+  onOpenPlateCalc: (target: PlateEditorTarget) => void;
+}) {
   const theme = useTheme();
   const addSet = useWorkout((s) => s.addSet);
   const removeSet = useWorkout((s) => s.removeSet);
   const updateSet = useWorkout((s) => s.updateSet);
   const toggleSet = useWorkout((s) => s.toggleSet);
+  const addWarmupSets = useWorkout((s) => s.addWarmupSets);
   const removeExercise = useWorkout((s) => s.removeExercise);
+  const warmupScheme = useSettings((s) => s.warmupScheme);
+  const plateInventory = useSettings((s) => s.plateInventory);
 
   const muscleColor = MUSCLE_COLOR[ex.primaryMuscle] ?? theme.colors.primary;
   const completedSets = ex.sets.filter((s) => s.completed).length;
   const allDone = ex.sets.length > 0 && completedSets === ex.sets.length;
+  const hasWarmup = ex.sets.some((s) => s.isWarmup);
+
+  function genWarmup() {
+    const firstWorking = ex.sets.find((s) => !s.isWarmup);
+    const workingKg = firstWorking?.weight && firstWorking.weight > 0 ? firstWorking.weight : lastCompleted?.weight ?? 0;
+    if (workingKg <= plateInventory.barKg) {
+      Alert.alert(
+        'Belum ada beban',
+        'Isi beban kerja lo dulu di set utama, baru gw auto-bikin warm-up dari situ.',
+      );
+      return;
+    }
+    const warmups = generateWarmup(workingKg, warmupScheme, plateInventory);
+    if (!warmups.length) {
+      Alert.alert('Gak butuh warm-up', 'Beban kerja lo terlalu deket bar, langsung gas aja.');
+      return;
+    }
+    addWarmupSets(
+      ex.exerciseId,
+      warmups.map((w) => ({ weight: w.weight, reps: w.reps })),
+    );
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => undefined);
+  }
 
   function confirmRemoveExercise() {
     Alert.alert('Hapus latihan ini?', `${ex.name} bakal dikeluarin dari workout.`, [
@@ -299,28 +394,49 @@ function ExerciseBlock({ ex, index }: { ex: ActiveExercise; index: number }) {
             </Pressable>
           </View>
 
-          <View
-            style={[
-              styles.setProgress,
-              {
-                backgroundColor: allDone
-                  ? theme.colors.successSoft
-                  : completedSets > 0
-                    ? muscleColor + '14'
-                    : theme.colors.surfaceMuted,
-              },
-            ]}
-          >
-            <Text
-              style={{
-                color: allDone ? theme.colors.success : completedSets > 0 ? muscleColor : theme.colors.textMuted,
-                fontSize: 10,
-                fontWeight: '800',
-                letterSpacing: 0.6,
-              }}
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
+            <View
+              style={[
+                styles.setProgress,
+                {
+                  backgroundColor: allDone
+                    ? theme.colors.successSoft
+                    : completedSets > 0
+                      ? muscleColor + '14'
+                      : theme.colors.surfaceMuted,
+                },
+              ]}
             >
-              {allDone ? '✓ SEMUA SET KELAR' : `${completedSets} / ${ex.sets.length} SET DONE`}
-            </Text>
+              <Text
+                style={{
+                  color: allDone ? theme.colors.success : completedSets > 0 ? muscleColor : theme.colors.textMuted,
+                  fontSize: 10,
+                  fontWeight: '800',
+                  letterSpacing: 0.6,
+                }}
+              >
+                {allDone ? '✓ SEMUA SET KELAR' : `${completedSets} / ${ex.sets.length} SET DONE`}
+              </Text>
+            </View>
+            {lastCompleted ? (
+              <View
+                style={[
+                  styles.setProgress,
+                  { backgroundColor: theme.colors.accent + '14' },
+                ]}
+              >
+                <Text
+                  style={{
+                    color: theme.colors.accent,
+                    fontSize: 10,
+                    fontWeight: '800',
+                    letterSpacing: 0.4,
+                  }}
+                >
+                  SESI LALU · {lastCompleted.weight} KG × {lastCompleted.reps}
+                </Text>
+              </View>
+            ) : null}
           </View>
 
           <View style={[styles.setHeader, { borderColor: theme.colors.border }]}>
@@ -330,26 +446,79 @@ function ExerciseBlock({ ex, index }: { ex: ActiveExercise; index: number }) {
             <View style={styles.colCheck} />
           </View>
 
-          {ex.sets.map((set, idx) => (
-            <SetRow
-              key={set.id}
-              set={set}
-              idx={idx}
-              muscleColor={muscleColor}
-              targetReps={`${ex.targetRepsMin}-${ex.targetRepsMax}`}
-              onChange={(patch) => updateSet(ex.exerciseId, set.id, patch)}
-              onToggle={() => toggleSet(ex.exerciseId, set.id)}
-              onRemove={() => removeSet(ex.exerciseId, set.id)}
-            />
-          ))}
+          {(() => {
+            let workingCounter = 0;
+            let warmupCounter = 0;
+            return ex.sets.map((set, idx) => {
+              const prev = idx > 0 ? ex.sets[idx - 1] : null;
+              const ghostWeight =
+                set.weight > 0
+                  ? null
+                  : prev?.weight && prev.weight > 0
+                    ? prev.weight
+                    : lastCompleted?.weight ?? null;
+              const ghostReps =
+                set.reps > 0
+                  ? null
+                  : prev?.reps && prev.reps > 0
+                    ? prev.reps
+                    : lastCompleted?.reps ?? null;
+              const indexLabel = set.isWarmup
+                ? `W${++warmupCounter}`
+                : String(++workingCounter);
+              return (
+                <SetRow
+                  key={set.id}
+                  set={set}
+                  indexLabel={indexLabel}
+                  muscleColor={muscleColor}
+                  targetReps={`${ex.targetRepsMin}-${ex.targetRepsMax}`}
+                  ghostWeight={ghostWeight}
+                  ghostReps={ghostReps}
+                  plateInventory={plateInventory}
+                  onChange={(patch) => updateSet(ex.exerciseId, set.id, patch)}
+                  onToggle={() => toggleSet(ex.exerciseId, set.id)}
+                  onRemove={() => removeSet(ex.exerciseId, set.id)}
+                  onOpenPlateCalc={() =>
+                    onOpenPlateCalc({
+                      exerciseId: ex.exerciseId,
+                      setId: set.id,
+                      exerciseName: ex.name,
+                      initialWeight: set.weight || ghostWeight || 0,
+                    })
+                  }
+                />
+              );
+            });
+          })()}
 
-          <Pressable
-            onPress={() => addSet(ex.exerciseId)}
-            style={[styles.addSet, { borderColor: theme.colors.border }]}
-          >
-            <Icon name="plus" size={14} color={theme.colors.textMuted} />
-            <Text style={{ color: theme.colors.textMuted, fontWeight: '700', fontSize: 12 }}>Tambah set</Text>
-          </Pressable>
+          <View style={{ flexDirection: 'row', gap: 8, marginTop: 4 }}>
+            <Pressable
+              onPress={() => addSet(ex.exerciseId)}
+              style={[styles.addSet, { borderColor: theme.colors.border, flex: 1 }]}
+            >
+              <Icon name="plus" size={14} color={theme.colors.textMuted} />
+              <Text style={{ color: theme.colors.textMuted, fontWeight: '700', fontSize: 12 }}>Tambah set</Text>
+            </Pressable>
+            {hasWarmup ? null : (
+              <Pressable
+                onPress={genWarmup}
+                style={[
+                  styles.addSet,
+                  {
+                    borderColor: theme.colors.warning + '88',
+                    backgroundColor: theme.colors.warningSoft,
+                    borderStyle: 'solid',
+                  },
+                ]}
+              >
+                <Icon name="flame" size={14} color={theme.colors.warning} />
+                <Text style={{ color: theme.colors.warning, fontWeight: '800', fontSize: 12 }}>
+                  Auto warm-up
+                </Text>
+              </Pressable>
+            )}
+          </View>
         </View>
       </View>
     </Card>
@@ -358,38 +527,70 @@ function ExerciseBlock({ ex, index }: { ex: ActiveExercise; index: number }) {
 
 function SetRow({
   set,
-  idx,
+  indexLabel,
   muscleColor,
   targetReps,
+  ghostWeight,
+  ghostReps,
+  plateInventory,
   onChange,
   onToggle,
   onRemove,
+  onOpenPlateCalc,
 }: {
   set: ActiveSet;
-  idx: number;
+  indexLabel: string;
   muscleColor: string;
   targetReps: string;
+  ghostWeight: number | null;
+  ghostReps: number | null;
+  plateInventory: import('@/lib/plates').PlateInventory;
   onChange: (patch: Partial<ActiveSet>) => void;
   onToggle: () => void;
   onRemove: () => void;
+  onOpenPlateCalc: () => void;
 }) {
   const theme = useTheme();
   const completed = set.completed;
+  const isWarmup = set.isWarmup;
+
+  const badgeColor = isWarmup
+    ? theme.colors.warning
+    : completed
+      ? theme.colors.success
+      : muscleColor;
+  const rowBg = completed
+    ? theme.colors.successSoft
+    : isWarmup
+      ? theme.colors.warningSoft
+      : theme.colors.surfaceMuted;
+  const rowBorder = completed
+    ? theme.colors.success + '55'
+    : isWarmup
+      ? theme.colors.warning + '55'
+      : 'transparent';
+
+  const weightLabel = set.weight > 0 ? `${set.weight}` : '';
+  const repsLabel = set.reps > 0 ? `${set.reps}` : '';
 
   function confirmRemove() {
-    Alert.alert(`Hapus set ${idx + 1}?`, 'Set ini bakal dikeluarin.', [
+    Alert.alert(`Hapus set ${indexLabel}?`, 'Set ini bakal dikeluarin.', [
       { text: 'Batal', style: 'cancel' },
       { text: 'Hapus', style: 'destructive', onPress: onRemove },
     ]);
   }
+
+  const effectiveWeight = set.weight > 0 ? set.weight : ghostWeight ?? 0;
+  const plateLine =
+    effectiveWeight > plateInventory.barKg ? plateHint(effectiveWeight, plateInventory) : null;
 
   return (
     <View
       style={[
         styles.setRow,
         {
-          backgroundColor: completed ? theme.colors.successSoft : theme.colors.surfaceMuted,
-          borderColor: completed ? theme.colors.success + '55' : 'transparent',
+          backgroundColor: rowBg,
+          borderColor: rowBorder,
         },
       ]}
     >
@@ -397,37 +598,56 @@ function SetRow({
         <View
           style={[
             styles.setNumberBadge,
-            {
-              backgroundColor: completed ? theme.colors.success : muscleColor,
-            },
+            { backgroundColor: badgeColor },
           ]}
         >
-          <Text style={{ color: '#fff', fontWeight: '800', fontSize: 13 }}>{idx + 1}</Text>
+          <Text style={{ color: '#fff', fontWeight: '800', fontSize: 11 }}>{indexLabel}</Text>
         </View>
       </Pressable>
       <View style={styles.colInput}>
-        <TextInput
-          value={set.weight ? String(set.weight) : ''}
-          keyboardType="decimal-pad"
-          placeholder="0"
-          placeholderTextColor={theme.colors.textDim}
-          onChangeText={(t) => onChange({ weight: Number(t.replace(',', '.')) || 0 })}
-          style={[
-            styles.setInput,
-            {
-              color: theme.colors.text,
-              backgroundColor: theme.colors.surface,
-              borderColor: completed ? theme.colors.success + '55' : theme.colors.border,
-            },
-          ]}
-        />
-        <Text style={{ color: theme.colors.textDim, fontSize: 9, fontWeight: '700', marginTop: 2 }}>kg</Text>
+        <View style={{ position: 'relative', width: '100%' }}>
+          <TextInput
+            value={weightLabel}
+            keyboardType="decimal-pad"
+            placeholder={ghostWeight ? String(ghostWeight) : '0'}
+            placeholderTextColor={theme.colors.textDim}
+            onChangeText={(t) => onChange({ weight: Number(t.replace(',', '.')) || 0 })}
+            style={[
+              styles.setInput,
+              {
+                color: theme.colors.text,
+                backgroundColor: theme.colors.surface,
+                borderColor: completed ? theme.colors.success + '55' : theme.colors.border,
+                paddingRight: 26,
+              },
+            ]}
+          />
+          <Pressable
+            onPress={onOpenPlateCalc}
+            hitSlop={8}
+            style={({ pressed }) => [
+              styles.platePill,
+              {
+                backgroundColor: theme.colors.primary + '22',
+                opacity: pressed ? 0.7 : 1,
+              },
+            ]}
+          >
+            <Text style={{ color: theme.colors.primary, fontWeight: '800', fontSize: 9 }}>kg</Text>
+          </Pressable>
+        </View>
+        <Text
+          numberOfLines={1}
+          style={{ color: theme.colors.textDim, fontSize: 9, fontWeight: '700', marginTop: 2 }}
+        >
+          {plateLine ?? 'kg'}
+        </Text>
       </View>
       <View style={styles.colInput}>
         <TextInput
-          value={set.reps ? String(set.reps) : ''}
+          value={repsLabel}
           keyboardType="number-pad"
-          placeholder="0"
+          placeholder={ghostReps ? String(ghostReps) : '0'}
           placeholderTextColor={theme.colors.textDim}
           onChangeText={(t) => onChange({ reps: Number(t.replace(',', '.')) || 0 })}
           style={[
@@ -440,7 +660,7 @@ function SetRow({
           ]}
         />
         <Text style={{ color: theme.colors.textDim, fontSize: 9, fontWeight: '700', marginTop: 2 }}>
-          target {targetReps}
+          {isWarmup ? 'warm-up' : `target ${targetReps}`}
         </Text>
       </View>
       <Pressable
@@ -668,6 +888,16 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  restControls: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  restBumpBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 10,
+    backgroundColor: 'rgba(0,0,0,0.18)',
+    minWidth: 38,
+    alignItems: 'center',
+  },
+  restBumpText: { color: '#fff', fontWeight: '800', fontSize: 11 },
   restSkipBtn: {
     paddingHorizontal: 12,
     paddingVertical: 8,
@@ -738,6 +968,16 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '700',
     textAlign: 'center',
+  },
+  platePill: {
+    position: 'absolute',
+    right: 4,
+    top: 4,
+    bottom: 4,
+    paddingHorizontal: 6,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   checkBtn: {
     borderWidth: 1,

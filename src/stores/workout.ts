@@ -3,6 +3,14 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '@/lib/supabase';
 import type { ExerciseRow, RoutineExerciseRow } from '@/lib/database.types';
 
+export interface LastCompletedSet {
+  weight: number;
+  reps: number;
+  savedAt: string;
+}
+
+type LastSetMap = Record<string, LastCompletedSet>;
+
 export interface ActiveSet {
   id: string;
   reps: number;
@@ -36,6 +44,7 @@ interface WorkoutState {
   active: ActiveWorkout | null;
   restRemaining: number;
   restTotal: number;
+  lastSets: LastSetMap;
   hydrate: () => Promise<void>;
   startEmpty: (name?: string) => void;
   startFromRoutine: (params: {
@@ -46,16 +55,22 @@ interface WorkoutState {
   addExercise: (ex: ExerciseRow) => void;
   removeExercise: (exerciseId: string) => void;
   addSet: (exerciseId: string) => void;
+  addWarmupSets: (
+    exerciseId: string,
+    warmups: Array<{ weight: number; reps: number }>,
+  ) => void;
   removeSet: (exerciseId: string, setId: string) => void;
   updateSet: (exerciseId: string, setId: string, patch: Partial<ActiveSet>) => void;
   toggleSet: (exerciseId: string, setId: string) => void;
   setRest: (seconds: number) => void;
+  bumpRest: (deltaSeconds: number) => void;
   tickRest: () => void;
   cancel: () => void;
   finish: () => Promise<{ error: string | null; workoutId?: string }>;
 }
 
 const STORAGE_KEY = '@forge/active-workout/v1';
+const LAST_SETS_KEY = '@forge/last-sets/v1';
 
 function uid(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -69,15 +84,34 @@ async function persist(active: ActiveWorkout | null) {
   await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(active));
 }
 
+async function persistLastSets(map: LastSetMap) {
+  try {
+    await AsyncStorage.setItem(LAST_SETS_KEY, JSON.stringify(map));
+  } catch {
+    // ignore
+  }
+}
+
 export const useWorkout = create<WorkoutState>((set, get) => ({
   active: null,
   restRemaining: 0,
   restTotal: 0,
+  lastSets: {},
   async hydrate() {
     try {
-      const raw = await AsyncStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        set({ active: JSON.parse(raw) as ActiveWorkout });
+      const [activeRaw, lastRaw] = await Promise.all([
+        AsyncStorage.getItem(STORAGE_KEY),
+        AsyncStorage.getItem(LAST_SETS_KEY),
+      ]);
+      const patch: { active?: ActiveWorkout; lastSets?: LastSetMap } = {};
+      if (activeRaw) {
+        patch.active = JSON.parse(activeRaw) as ActiveWorkout;
+      }
+      if (lastRaw) {
+        patch.lastSets = JSON.parse(lastRaw) as LastSetMap;
+      }
+      if (Object.keys(patch).length > 0) {
+        set(patch);
       }
     } catch {
       // ignore
@@ -170,7 +204,8 @@ export const useWorkout = create<WorkoutState>((set, get) => ({
       ...active,
       exercises: active.exercises.map((e) => {
         if (e.exerciseId !== exerciseId) return e;
-        const last = e.sets[e.sets.length - 1];
+        const lastWorking = [...e.sets].reverse().find((s) => !s.isWarmup);
+        const last = lastWorking ?? e.sets[e.sets.length - 1];
         return {
           ...e,
           sets: [
@@ -185,6 +220,33 @@ export const useWorkout = create<WorkoutState>((set, get) => ({
             },
           ],
         };
+      }),
+    };
+    set({ active: next });
+    void persist(next);
+  },
+  addWarmupSets(exerciseId, warmups) {
+    const active = get().active;
+    if (!active) return;
+    if (!warmups.length) return;
+    const next: ActiveWorkout = {
+      ...active,
+      exercises: active.exercises.map((e) => {
+        if (e.exerciseId !== exerciseId) return e;
+        const existingWarmups = e.sets.filter((s) => s.isWarmup);
+        const workingSets = e.sets.filter((s) => !s.isWarmup);
+        if (existingWarmups.length > 0) {
+          return e;
+        }
+        const warmupSets: ActiveSet[] = warmups.map((w) => ({
+          id: uid(),
+          reps: w.reps,
+          weight: w.weight,
+          rpe: null,
+          isWarmup: true,
+          completed: false,
+        }));
+        return { ...e, sets: [...warmupSets, ...workingSets] };
       }),
     };
     set({ active: next });
@@ -219,30 +281,47 @@ export const useWorkout = create<WorkoutState>((set, get) => ({
   toggleSet(exerciseId, setId) {
     const active = get().active;
     if (!active) return;
-    let restTrigger = 0;
+    const exercise = active.exercises.find((e) => e.exerciseId === exerciseId);
+    const targetSet = exercise?.sets.find((s) => s.id === setId);
+    if (!exercise || !targetSet) return;
+    const willComplete = !targetSet.completed;
     const next: ActiveWorkout = {
       ...active,
       exercises: active.exercises.map((e) => {
         if (e.exerciseId !== exerciseId) return e;
         return {
           ...e,
-          sets: e.sets.map((s) => {
-            if (s.id !== setId) return s;
-            const completed = !s.completed;
-            if (completed) restTrigger = e.targetRestSeconds;
-            return { ...s, completed };
-          }),
+          sets: e.sets.map((s) => (s.id === setId ? { ...s, completed: willComplete } : s)),
         };
       }),
     };
     set({ active: next });
     void persist(next);
-    if (restTrigger > 0) {
-      set({ restRemaining: restTrigger, restTotal: restTrigger });
+    if (willComplete) {
+      set({ restRemaining: exercise.targetRestSeconds, restTotal: exercise.targetRestSeconds });
+      if (!targetSet.isWarmup && targetSet.weight > 0) {
+        const nextLast: LastSetMap = {
+          ...get().lastSets,
+          [exerciseId]: {
+            weight: targetSet.weight,
+            reps: targetSet.reps,
+            savedAt: new Date().toISOString(),
+          },
+        };
+        set({ lastSets: nextLast });
+        void persistLastSets(nextLast);
+      }
     }
   },
   setRest(seconds) {
     set({ restRemaining: seconds, restTotal: seconds });
+  },
+  bumpRest(deltaSeconds) {
+    const { restRemaining, restTotal } = get();
+    if (restRemaining <= 0) return;
+    const nextRemaining = Math.max(0, restRemaining + deltaSeconds);
+    const nextTotal = Math.max(nextRemaining, restTotal);
+    set({ restRemaining: nextRemaining, restTotal: nextTotal });
   },
   tickRest() {
     const { restRemaining } = get();
