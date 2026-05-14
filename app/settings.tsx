@@ -14,6 +14,15 @@ import { useTheme } from '@/components/ThemeProvider';
 import { useAuth } from '@/stores/auth';
 import { useSettings } from '@/stores/settings';
 import { useProfile } from '@/stores/profile';
+import { DEFAULT_WARMUP_SCHEME } from '@/lib/plates';
+
+const PLATE_OPTIONS = [25, 20, 15, 10, 5, 2.5, 1.25];
+const BAR_OPTIONS = [15, 20, 25];
+
+function fmt(n: number): string {
+  if (Number.isInteger(n)) return String(n);
+  return n.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+}
 
 export default function SettingsScreen() {
   const theme = useTheme();
@@ -25,6 +34,11 @@ export default function SettingsScreen() {
   const setTheme = useSettings((s) => s.setTheme);
   const restDefault = useSettings((s) => s.defaultRestSeconds);
   const setRest = useSettings((s) => s.setDefaultRest);
+  const plateInventory = useSettings((s) => s.plateInventory);
+  const setPlateInventory = useSettings((s) => s.setPlateInventory);
+  const resetPlateInventory = useSettings((s) => s.resetPlateInventory);
+  const warmupScheme = useSettings((s) => s.warmupScheme);
+  const resetWarmupScheme = useSettings((s) => s.resetWarmupScheme);
   const profile = useProfile((s) => s.data);
   const resetProfile = useProfile((s) => s.reset);
 
@@ -158,6 +172,112 @@ export default function SettingsScreen() {
           </Card>
         </View>
 
+        {/* Plate inventory + warm-up */}
+        <View style={{ gap: 10 }}>
+          <SectionHeader title="Equipment & Warm-up" />
+
+          <Card padding={16} style={{ gap: 12 }}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+              <Text style={[styles.kicker, { color: theme.colors.textMuted }]}>PLATE INVENTORY (KG)</Text>
+              <Pressable onPress={() => void resetPlateInventory()} hitSlop={6}>
+                <Text style={{ color: theme.colors.primary, fontSize: 11, fontWeight: '800' }}>Reset</Text>
+              </Pressable>
+            </View>
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
+              {PLATE_OPTIONS.map((p) => {
+                const active = plateInventory.kg.includes(p);
+                return (
+                  <Pressable
+                    key={p}
+                    onPress={() => {
+                      const next = active
+                        ? plateInventory.kg.filter((x) => x !== p)
+                        : [...plateInventory.kg, p].sort((a, b) => b - a);
+                      if (next.length === 0) {
+                        Alert.alert('Minimal 1 plate', 'Gym lo gak punya plate? Pilih minimal 1 ukuran ya.');
+                        return;
+                      }
+                      void setPlateInventory({ ...plateInventory, kg: next });
+                    }}
+                    style={[
+                      styles.platePill,
+                      {
+                        backgroundColor: active ? theme.colors.primary + '22' : theme.colors.surfaceMuted,
+                        borderColor: active ? theme.colors.primary : theme.colors.border,
+                      },
+                    ]}
+                  >
+                    <Text
+                      style={{
+                        color: active ? theme.colors.primary : theme.colors.textMuted,
+                        fontWeight: '800',
+                        fontSize: 12,
+                      }}
+                    >
+                      {fmt(p)}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+
+            <Text style={[styles.kicker, { color: theme.colors.textMuted, marginTop: 4 }]}>
+              BAR
+            </Text>
+            <SegmentedControl
+              value={String(plateInventory.barKg)}
+              onChange={(v) =>
+                void setPlateInventory({ ...plateInventory, barKg: Number(v) })
+              }
+              options={BAR_OPTIONS.map((b) => ({
+                value: String(b),
+                label: `${b} kg`,
+              }))}
+            />
+            <Text style={{ color: theme.colors.textDim, fontSize: 11 }}>
+              Default Olympic bar 20 kg. Pakai 15 kg buat training bar atau 25 kg buat power bar.
+            </Text>
+          </Card>
+
+          <Card padding={16} style={{ gap: 10 }}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+              <Text style={[styles.kicker, { color: theme.colors.textMuted }]}>WARM-UP SCHEME</Text>
+              <Pressable onPress={() => void resetWarmupScheme()} hitSlop={6}>
+                <Text style={{ color: theme.colors.primary, fontSize: 11, fontWeight: '800' }}>Reset</Text>
+              </Pressable>
+            </View>
+            {warmupScheme.steps.map((step, idx) => (
+              <View
+                key={idx}
+                style={[
+                  styles.warmupRow,
+                  { backgroundColor: theme.colors.surfaceMuted, borderColor: theme.colors.border },
+                ]}
+              >
+                <View
+                  style={[
+                    styles.warmupBadge,
+                    { backgroundColor: theme.colors.warning + '22' },
+                  ]}
+                >
+                  <Text style={{ color: theme.colors.warning, fontWeight: '800', fontSize: 11 }}>
+                    W{idx + 1}
+                  </Text>
+                </View>
+                <Text style={{ color: theme.colors.text, fontWeight: '800', fontSize: 14 }}>
+                  {Math.round(step.percent * 100)}%
+                </Text>
+                <Text style={{ color: theme.colors.textMuted, fontSize: 13 }}>
+                  × {step.reps} reps
+                </Text>
+              </View>
+            ))}
+            <Text style={{ color: theme.colors.textDim, fontSize: 11 }}>
+              Default ladder {DEFAULT_WARMUP_SCHEME.steps.map((s) => `${Math.round(s.percent * 100)}%`).join(' → ')} dari beban kerja. Tap "Auto warm-up" pas workout buat generate.
+            </Text>
+          </Card>
+        </View>
+
         {/* Tools */}
         <View style={{ gap: 10 }}>
           <SectionHeader title="Tools" />
@@ -274,6 +394,30 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   kicker: { fontSize: 11, fontWeight: '800', letterSpacing: 0.8 },
+  platePill: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+    minWidth: 56,
+    alignItems: 'center',
+  },
+  warmupRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+  },
+  warmupBadge: {
+    width: 32,
+    height: 24,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   restChip: {
     flex: 1,
     paddingVertical: 12,
